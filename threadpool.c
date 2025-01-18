@@ -1,56 +1,117 @@
-#include "threadpool.h"
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+#include "threadpool.h"
 
-threadpool* create_threadpool(int num_threads_in_pool, int max_queue_size) {
-    if (num_threads_in_pool <= 0 || num_threads_in_pool > MAXT_IN_POOL ||
-        max_queue_size <= 0 || max_queue_size > MAXW_IN_QUEUE) {
-        fprintf(stderr, "Invalid parameters for threadpool creation.\n");
-        return NULL;
+/*
+ * do_work() is the thread entry point.
+ * Threads loop here, waiting for work in the pool's queue.
+ * Once work arrives, a thread removes it from the queue and processes it.
+ */
+
+void* do_work(void* p) {
+    threadpool* pool = (threadpool*)p;
+
+    while (1) {
+        /* Lock the queue */
+        pthread_mutex_lock(&(pool->qlock));
+
+        /* If no work and not shutting down, wait */
+        while ((pool->qsize == 0) && (!pool->shutdown)) {
+            pthread_cond_wait(&(pool->q_not_empty), &(pool->qlock));
         }
 
-    threadpool *pool = (threadpool *)malloc(sizeof(threadpool));
-    if (!pool) {
-        perror("Failed to allocate memory for threadpool");
+        /* If we're shutting down, exit this thread */
+        if (pool->shutdown) {
+            pthread_mutex_unlock(&(pool->qlock));
+            pthread_exit(NULL);
+        }
+
+        /* Now we have at least one work item in the queue */
+        work_t* work = pool->qhead;
+        if (work == NULL) {
+            /* Spurious wakeup or something else? */
+            pthread_mutex_unlock(&(pool->qlock));
+            continue;
+        }
+
+        /* Remove the work from the queue */
+        pool->qhead = work->next;
+        pool->qsize--;
+
+        /* If the queue is now empty, adjust qtail as well */
+        if (pool->qsize == 0) {
+            pool->qtail = NULL;
+            /* If we are not accepting any more and the queue just became empty, notify destroy_threadpool */
+            if (pool->dont_accept) {
+                pthread_cond_broadcast(&(pool->q_empty));
+            }
+        }
+
+        /* If queue was full before, signal that it's not full now */
+        if (pool->qsize == (pool->max_qsize - 1)) {
+            pthread_cond_broadcast(&(pool->q_not_full));
+        }
+
+        /* Unlock the queue so other threads can access it */
+        pthread_mutex_unlock(&(pool->qlock));
+
+        /* Perform the actual work routine */
+        (*(work->routine))(work->arg);
+
+        /* Free the work structure */
+        free(work);
+    }
+
+    return NULL;
+}
+
+/*
+ * create_threadpool() - creates a fixed-size thread pool of num_threads_in_pool threads.
+ */
+threadpool* create_threadpool(int num_threads_in_pool, int max_queue_size) {
+    if (num_threads_in_pool <= 0 || num_threads_in_pool > MAXT_IN_POOL) {
+        fprintf(stderr, "Error: Invalid number of threads.\n");
+        return NULL;
+    }
+    if (max_queue_size <= 0 || max_queue_size > MAXW_IN_QUEUE) {
+        fprintf(stderr, "Error: Invalid queue size.\n");
         return NULL;
     }
 
-    // Initialize threadpool structure
+    threadpool* pool = (threadpool*)malloc(sizeof(threadpool));
+    if (!pool) {
+        perror("malloc");
+        return NULL;
+    }
+
     pool->num_threads = num_threads_in_pool;
-    pool->max_qsize = max_queue_size;
     pool->qsize = 0;
+    pool->max_qsize = max_queue_size;
+    pool->threads = (pthread_t*)malloc(sizeof(pthread_t) * num_threads_in_pool);
+    if (!pool->threads) {
+        perror("malloc");
+        free(pool);
+        return NULL;
+    }
+
     pool->qhead = NULL;
     pool->qtail = NULL;
     pool->shutdown = 0;
     pool->dont_accept = 0;
 
-    // Initialize mutex and condition variables
-    if (pthread_mutex_init(&(pool->qlock), NULL) != 0 ||
-        pthread_cond_init(&(pool->q_not_empty), NULL) != 0 ||
-        pthread_cond_init(&(pool->q_empty), NULL) != 0 ||
-        pthread_cond_init(&(pool->q_not_full), NULL) != 0) {
-        perror("Failed to initialize mutex or condition variables");
-        free(pool);
-        return NULL;
-        }
+    pthread_mutex_init(&(pool->qlock), NULL);
+    pthread_cond_init(&(pool->q_not_empty), NULL);
+    pthread_cond_init(&(pool->q_empty), NULL);
+    pthread_cond_init(&(pool->q_not_full), NULL);
 
-    // Allocate memory for threads
-    pool->threads = (pthread_t *)malloc(sizeof(pthread_t) * num_threads_in_pool);
-    if (!pool->threads) {
-        perror("Failed to allocate memory for threads");
-        pthread_mutex_destroy(&(pool->qlock));
-        pthread_cond_destroy(&(pool->q_not_empty));
-        pthread_cond_destroy(&(pool->q_empty));
-        pthread_cond_destroy(&(pool->q_not_full));
-        free(pool);
-        return NULL;
-    }
-
-    // Create threads
+    /* Create threads */
     for (int i = 0; i < num_threads_in_pool; i++) {
-        if (pthread_create(&(pool->threads[i]), NULL, do_work, (void *)pool) != 0) {
-            perror("Failed to create thread");
+        if (pthread_create(&(pool->threads[i]), NULL, do_work, pool) != 0) {
+            perror("pthread_create");
+            /* If we fail here, we should set up a partial destruction,
+               but for simplicity, we just clean up and return NULL */
             destroy_threadpool(pool);
             return NULL;
         }
@@ -59,135 +120,109 @@ threadpool* create_threadpool(int num_threads_in_pool, int max_queue_size) {
     return pool;
 }
 
-void dispatch(threadpool* from_me, int (*dispatch_to_here)(void *), void *arg) {
-    if (!from_me || !dispatch_to_here) {
-        fprintf(stderr, "Invalid parameters for dispatch.\n");
-        return;
-    }
+/*
+ * dispatch() - add a work function to the queue of work that the threadpool must process.
+ */
+void dispatch(threadpool* from_me, dispatch_fn dispatch_to_here, void *arg) {
+    if (!from_me || !dispatch_to_here) return;
 
-    pthread_mutex_lock(&(from_me->qlock));
-
-    // If the pool is shutting down or not accepting jobs
-    if (from_me->dont_accept) {
-        pthread_mutex_unlock(&(from_me->qlock));
-        return;
-    }
-
-    // Wait if the queue is full
-    while (from_me->qsize >= from_me->max_qsize) {
-        pthread_cond_wait(&(from_me->q_not_full), &(from_me->qlock));
-    }
-
-    // Create and initialize a new work item
-    work_t *work = (work_t *)malloc(sizeof(work_t));
+    /* Create a new work_t struct */
+    work_t* work = (work_t*)malloc(sizeof(work_t));
     if (!work) {
-        perror("Failed to allocate memory for work item");
-        pthread_mutex_unlock(&(from_me->qlock));
+        /* If we cannot allocate, there's a bigger problem,
+           but let's just return (or could send 500 to client). */
+        perror("malloc");
         return;
     }
     work->routine = dispatch_to_here;
     work->arg = arg;
     work->next = NULL;
 
-    // Add the work item to the queue
-    if (from_me->qtail) {
-        from_me->qtail->next = work;
-    } else {
-        from_me->qhead = work;
-    }
-    from_me->qtail = work;
-    from_me->qsize++;
+    /* Lock the queue for modifications */
+    pthread_mutex_lock(&(from_me->qlock));
 
-    // Signal that the queue is not empty
-    pthread_cond_signal(&(from_me->q_not_empty));
+    /* If destroy_threadpool() has begun, we do not accept new work */
+    if (from_me->dont_accept) {
+        /* free the work and return */
+        free(work);
+        pthread_mutex_unlock(&(from_me->qlock));
+        return;
+    }
+
+    /* If the queue is full, wait until it's not full */
+    while ((from_me->qsize == from_me->max_qsize) && (!from_me->shutdown) && (!from_me->dont_accept)) {
+        pthread_cond_wait(&(from_me->q_not_full), &(from_me->qlock));
+    }
+
+    if (from_me->shutdown || from_me->dont_accept) {
+        /* No longer accepting jobs */
+        free(work);
+        pthread_mutex_unlock(&(from_me->qlock));
+        return;
+    }
+
+    /* Add the new work to the tail of the queue */
+    if (from_me->qsize == 0) {
+        from_me->qhead = work;
+        from_me->qtail = work;
+        /* If queue was empty, now we must signal that it's not empty */
+        pthread_cond_broadcast(&(from_me->q_not_empty));
+    } else {
+        from_me->qtail->next = work;
+        from_me->qtail = work;
+    }
+    from_me->qsize++;
 
     pthread_mutex_unlock(&(from_me->qlock));
 }
 
-void* do_work(void* p) {
-    threadpool *pool = (threadpool *)p;
-
-    while (1) {
-        pthread_mutex_lock(&(pool->qlock));
-
-        // Wait until there is work or the pool is shutting down
-        while (pool->qsize == 0 && !pool->shutdown) {
-            pthread_cond_wait(&(pool->q_not_empty), &(pool->qlock));
-        }
-
-        // Exit if the pool is shutting down
-        if (pool->shutdown) {
-            pthread_mutex_unlock(&(pool->qlock));
-            pthread_exit(NULL);
-        }
-
-        // Get the next work item
-        work_t *work = pool->qhead;
-        if (work) {
-            pool->qhead = work->next;
-            if (!pool->qhead) {
-                pool->qtail = NULL;
-            }
-            pool->qsize--;
-
-            // Signal that there is space in the queue
-            if (pool->qsize < pool->max_qsize) {
-                pthread_cond_signal(&(pool->q_not_full));
-            }
-        }
-
-        pthread_mutex_unlock(&(pool->qlock));
-
-        // Execute the work routine
-        if (work) {
-            work->routine(work->arg);
-            free(work);
-        }
-    }
-}
-
+/*
+ * destroy_threadpool() - gracefully shutdown the threadpool,
+ * waiting for running jobs to finish, then free all resources.
+ */
 void destroy_threadpool(threadpool* destroyme) {
     if (!destroyme) return;
 
     pthread_mutex_lock(&(destroyme->qlock));
 
-    // Stop accepting new jobs
+    /* Stop accepting new work */
     destroyme->dont_accept = 1;
 
-    // Wait for all work to finish
-    while (destroyme->qsize > 0) {
+    /* Wait for the queue to become empty, if necessary */
+    while (destroyme->qsize != 0) {
         pthread_cond_wait(&(destroyme->q_empty), &(destroyme->qlock));
     }
 
-    // Shutdown the pool
+    /* Now tell all threads to shutdown */
     destroyme->shutdown = 1;
 
-    // Wake up any threads waiting on conditions
+    /* Wake up any threads that are waiting on empty/other conditions */
     pthread_cond_broadcast(&(destroyme->q_not_empty));
     pthread_cond_broadcast(&(destroyme->q_not_full));
 
     pthread_mutex_unlock(&(destroyme->qlock));
 
-    // Join all threads
+    /* Join all threads */
     for (int i = 0; i < destroyme->num_threads; i++) {
         pthread_join(destroyme->threads[i], NULL);
     }
 
-    // Clean up resources
+    /* Cleanup */
+    free(destroyme->threads);
+
+    /* Delete any remaining work in the queue (should be empty by now) */
+    work_t* cur = destroyme->qhead;
+    while (cur) {
+        work_t* tmp = cur;
+        cur = cur->next;
+        free(tmp);
+    }
+
     pthread_mutex_destroy(&(destroyme->qlock));
     pthread_cond_destroy(&(destroyme->q_not_empty));
     pthread_cond_destroy(&(destroyme->q_empty));
     pthread_cond_destroy(&(destroyme->q_not_full));
 
-    free(destroyme->threads);
-
-    // Free any remaining work items in the queue
-    work_t *current = destroyme->qhead;
-    while (current) {
-        work_t *next = current->next;
-        free(current);
-        current = next;
-    }
-
     free(destroyme);
 }
+
