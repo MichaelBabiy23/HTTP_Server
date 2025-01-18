@@ -58,3 +58,49 @@ threadpool* create_threadpool(int num_threads_in_pool, int max_queue_size) {
 
     return pool;
 }
+
+void dispatch(threadpool* from_me, int (*dispatch_to_here)(void *), void *arg) {
+    if (!from_me || !dispatch_to_here) {
+        fprintf(stderr, "Invalid parameters for dispatch.\n");
+        return;
+    }
+
+    pthread_mutex_lock(&(from_me->qlock));
+
+    // If the pool is shutting down or not accepting jobs
+    if (from_me->dont_accept) {
+        pthread_mutex_unlock(&(from_me->qlock));
+        return;
+    }
+
+    // Wait if the queue is full
+    while (from_me->qsize >= from_me->max_qsize) {
+        pthread_cond_wait(&(from_me->q_not_full), &(from_me->qlock));
+    }
+
+    // Create and initialize a new work item
+    work_t *work = (work_t *)malloc(sizeof(work_t));
+    if (!work) {
+        perror("Failed to allocate memory for work item");
+        pthread_mutex_unlock(&(from_me->qlock));
+        return;
+    }
+    work->routine = dispatch_to_here;
+    work->arg = arg;
+    work->next = NULL;
+
+    // Add the work item to the queue
+    if (from_me->qtail) {
+        from_me->qtail->next = work;
+    } else {
+        from_me->qhead = work;
+    }
+    from_me->qtail = work;
+    from_me->qsize++;
+
+    // Signal that the queue is not empty
+    pthread_cond_signal(&(from_me->q_not_empty));
+
+    pthread_mutex_unlock(&(from_me->qlock));
+}
+
