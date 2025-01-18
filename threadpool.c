@@ -104,3 +104,46 @@ void dispatch(threadpool* from_me, int (*dispatch_to_here)(void *), void *arg) {
     pthread_mutex_unlock(&(from_me->qlock));
 }
 
+void* do_work(void* p) {
+    threadpool *pool = (threadpool *)p;
+
+    while (1) {
+        pthread_mutex_lock(&(pool->qlock));
+
+        // Wait until there is work or the pool is shutting down
+        while (pool->qsize == 0 && !pool->shutdown) {
+            pthread_cond_wait(&(pool->q_not_empty), &(pool->qlock));
+        }
+
+        // Exit if the pool is shutting down
+        if (pool->shutdown) {
+            pthread_mutex_unlock(&(pool->qlock));
+            pthread_exit(NULL);
+        }
+
+        // Get the next work item
+        work_t *work = pool->qhead;
+        if (work) {
+            pool->qhead = work->next;
+            if (!pool->qhead) {
+                pool->qtail = NULL;
+            }
+            pool->qsize--;
+
+            // Signal that there is space in the queue
+            if (pool->qsize < pool->max_qsize) {
+                pthread_cond_signal(&(pool->q_not_full));
+            }
+        }
+
+        pthread_mutex_unlock(&(pool->qlock));
+
+        // Execute the work routine
+        if (work) {
+            work->routine(work->arg);
+            free(work);
+        }
+    }
+
+    return NULL;
+}
