@@ -144,6 +144,50 @@ void* do_work(void* p) {
             free(work);
         }
     }
+}
 
-    return NULL;
+void destroy_threadpool(threadpool* destroyme) {
+    if (!destroyme) return;
+
+    pthread_mutex_lock(&(destroyme->qlock));
+
+    // Stop accepting new jobs
+    destroyme->dont_accept = 1;
+
+    // Wait for all work to finish
+    while (destroyme->qsize > 0) {
+        pthread_cond_wait(&(destroyme->q_empty), &(destroyme->qlock));
+    }
+
+    // Shutdown the pool
+    destroyme->shutdown = 1;
+
+    // Wake up any threads waiting on conditions
+    pthread_cond_broadcast(&(destroyme->q_not_empty));
+    pthread_cond_broadcast(&(destroyme->q_not_full));
+
+    pthread_mutex_unlock(&(destroyme->qlock));
+
+    // Join all threads
+    for (int i = 0; i < destroyme->num_threads; i++) {
+        pthread_join(destroyme->threads[i], NULL);
+    }
+
+    // Clean up resources
+    pthread_mutex_destroy(&(destroyme->qlock));
+    pthread_cond_destroy(&(destroyme->q_not_empty));
+    pthread_cond_destroy(&(destroyme->q_empty));
+    pthread_cond_destroy(&(destroyme->q_not_full));
+
+    free(destroyme->threads);
+
+    // Free any remaining work items in the queue
+    work_t *current = destroyme->qhead;
+    while (current) {
+        work_t *next = current->next;
+        free(current);
+        current = next;
+    }
+
+    free(destroyme);
 }
