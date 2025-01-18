@@ -1,0 +1,90 @@
+HTTP Server
+
+This project implements a multithreaded HTTP server supporting a limited subset of the HTTP/1.0 specification. It only handles **GET** requests and returns minimal HTML error pages for standard error cases (e.g., `404 Not Found`, `403 Forbidden`, etc.). The server uses a **thread pool** to manage concurrent requests.
+
+## File Structure
+
+- **server.c**
+  Contains the `main(int argc, char *argv[])` function:
+  1. Parses command-line arguments.
+  2. Creates a listening socket on the specified port.
+  3. Accepts client connections until a set maximum count.
+  4. Dispatches each accepted connection to a thread pool.
+
+- **threadpool.c**
+  Implements the thread pool logic:
+  - Creates worker threads.
+  - Maintains a queue of pending jobs.
+  - Shuts down gracefully after reaching the maximum request count.
+
+- **threadpool.h**
+  Declares the data structures and function prototypes for the thread pool.
+
+## Compilation
+
+Compile the server with the **pthread** library. Example:
+
+```bash
+gcc -Wall -Wextra -o server server.c threadpool.c -lpthread
+```
+
+This will create an executable **`server`**.
+
+## Usage
+
+Run the server with:
+```
+./server <port> <pool-size> <max-queue-size> <max-number-of-request>
+```
+
+Example:
+```
+./server 8080 4 8 100
+```
+Where:
+- **`port`**: The port on which the server listens (e.g., 8080).
+- **`pool-size`**: Number of worker threads in the thread pool.
+- **`max-queue-size`**: Maximum number of pending jobs in the work queue.
+- **`max-number-of-request`**: Total number of incoming connections the server will accept before shutting down.
+
+## Features
+
+1. **GET Method Only**
+   - Other methods return a `501 Not supported` error.
+
+2. **Directory Support**
+   - If a directory is requested without a trailing slash, the server returns `302 Found`.
+   - If `index.html` is present inside a requested directory, it is served; otherwise, an auto-generated listing is returned.
+
+3. **Permissions**
+   - The server checks read (`R_OK`) permissions on files and execute (`X_OK`) on directories in the path.
+
+4. **Error Handling**
+   - Minimal HTML pages are returned for `403 Forbidden`, `404 Not Found`, `400 Bad Request`, `501 Not supported`, and `500 Internal Server Error`.
+
+5. **Thread Pool**
+   - A fixed-size pool of threads handles connections.
+   - Jobs are queued if all threads are busy, up to `max-queue-size`.
+
+## Example Usage with a Browser
+
+After running:
+
+```
+./server 8080 4 8 100
+```
+
+Open a browser and visit:
+
+```
+http://localhost:8080/
+```
+
+(if an `index.html` file or a directory listing is available at the server root directory).
+
+## Known Limitations
+
+- Only the **first line** of each request is parsed; additional headers are ignored.
+- Only supports **HTTP/1.0** style responses, closing the connection after each request.
+- No advanced HTTP features (e.g., chunked encoding, partial content, etc.) are handled.
+- The server returns `501` for any method other than GET.

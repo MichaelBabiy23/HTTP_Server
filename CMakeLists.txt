@@ -4,4 +4,5 @@ project(HTTP_Server C)
 set(CMAKE_C_STANDARD 11)
 
 add_executable(HTTP_Server main.c
-        server.c)
+        server.c
+        threadpool.c)
