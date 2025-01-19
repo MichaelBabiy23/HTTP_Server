@@ -251,9 +251,9 @@ int construct_OK_body(char *path, unsigned char **body, int *size) {
             return -1;
         }
         return 0;
+    }
     /* Read file into memory */
     return open_read_file(body, path, size);
-    }
 }
 
 /* Returns 1 if "dirname/index.html" exists, else 0 */
@@ -308,6 +308,7 @@ int open_read_file(unsigned char **body, char *path, int *size) {
     fclose(f);
 
     *size = (int)sz;
+    DEBUG_PRINT("open_read_file : body = %d \n", *size);
     return 0;
 }
 
@@ -465,21 +466,15 @@ unsigned char *build_http_response(int code, char *path, const unsigned char *bo
     /* If non-200, we build an HTML error body. */
     char fallback[512];
     memset(fallback, 0, sizeof(fallback));
+    long actual_body_len = 0;
     if (code != 200) {
         snprintf(fallback, sizeof(fallback), err_tmpl, code, text, code, text, msg);
+        actual_body_len = (long)strlen(fallback);
+    } else {
+        actual_body_len = b_len;  // Use provided body length for 200 responses
     }
-
-    /* For 200, see if we have a MIME type and last-mod date. */
-    const char *mtype = NULL;
-    const char *lmod  = NULL;
-    if (code == 200 && path) {
-        mtype = is_directory(path) ? "text/html" : get_mime_type(path);
-        lmod  = get_last_modified_date(path);
-    }
-
-    long actual_body_len = (code == 200 ? b_len : (long)strlen(fallback));
-
-    /* Make a small buffer for headers. Then we append the body. */
+    DEBUG_PRINT("build_http_response : actual_body_len = %li \n", actual_body_len);
+    /* Make a small buffer for headers. */
     char head[512];
     char date[128];
     get_current_date(date, sizeof(date));
@@ -495,34 +490,42 @@ unsigned char *build_http_response(int code, char *path, const unsigned char *bo
                          "Location: %s/\r\n", path);
     }
 
+    /* Set Content-Type */
+    const char *mtype = NULL;
+    if (code == 200 && path) {
+        mtype = is_directory(path) ? "text/html" : get_mime_type(path);
+    } else if (code != 200) {
+        mtype = "text/html";  // Error responses are always HTML
+    }
+
     if (mtype) {
         used += snprintf(head + used, sizeof(head) - used,
                          "Content-Type: %s\r\n", mtype);
-    } else if (code != 200) {
-        /* For errors, let's explicitly say text/html. */
-        used += snprintf(head + used, sizeof(head) - used,
-                         "Content-Type: text/html\r\n");
     }
 
+    /* Add Content-Length */
     used += snprintf(head + used, sizeof(head) - used,
                      "Content-Length: %ld\r\n", actual_body_len);
 
-    if (code == 200 && lmod) {
-        used += snprintf(head + used, sizeof(head) - used,
-                         "Last-Modified: %s\r\n", lmod);
+    if (code == 200 && path) {
+        const char *lmod = get_last_modified_date(path);
+        if (lmod) {
+            used += snprintf(head + used, sizeof(head) - used,
+                             "Last-Modified: %s\r\n", lmod);
+        }
     }
 
     used += snprintf(head + used, sizeof(head) - used,
                      "Connection: close\r\n\r\n");
 
-    /* The response is headers + body. */
-    long total_len = used + actual_body_len;
-    unsigned char *resp = malloc(total_len);
+    /* Allocate memory for the complete response: headers + body */
+    unsigned char *resp = malloc(used + actual_body_len);
     if (!resp) {
         *resp_len = 0;
         return NULL;
     }
 
+    /* Copy headers and body into the response buffer */
     memcpy(resp, head, used);
     if (code == 200) {
         memcpy(resp + used, body, actual_body_len);
@@ -530,6 +533,6 @@ unsigned char *build_http_response(int code, char *path, const unsigned char *bo
         memcpy(resp + used, fallback, actual_body_len);
     }
 
-    *resp_len = (int)total_len;
+    *resp_len = used + actual_body_len; // Full response size
     return resp;
 }
