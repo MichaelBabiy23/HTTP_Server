@@ -337,7 +337,7 @@ int generate_directory_listing(const char *dir, char **html_body, int *is_alloc,
     char path_buf[1024];
     while ((de = readdir(dp)) != NULL) {
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-        snprintf(path_buf, sizeof(path_buf), "%s%s", dir, de->d_name);
+        snprintf(path_buf, sizeof(path_buf), "%s/%s", dir, de->d_name);
 
         struct stat st;
         if (stat(path_buf, &st) != 0) continue;
@@ -347,14 +347,20 @@ int generate_directory_listing(const char *dir, char **html_body, int *is_alloc,
         strftime(time_buf, sizeof(time_buf), RFC1123FMT, gmtime(&st.st_mtime));
 
         char sz_buf[64] = "";
+        char name_buf[1024];
+        snprintf(name_buf, sizeof(name_buf), "%s", de->d_name);
+
         if (S_ISREG(st.st_mode)) {
             snprintf(sz_buf, sizeof(sz_buf), "%ld", (long)st.st_size);
+        } else if (S_ISDIR(st.st_mode)) {
+            /* Add a '/' to directory names */
+            strncat(name_buf, "/", sizeof(name_buf) - strlen(name_buf) - 1);
         }
 
         /* Expand buffer if needed */
         size_t row_len = snprintf(NULL, 0,
             "<tr><td><A HREF=\"%s\">%s</A></td><td>%s</td><td>%s</td></tr>\n",
-            de->d_name, de->d_name, time_buf, sz_buf);
+            name_buf, name_buf, time_buf, sz_buf);
 
         if (used + row_len + 2 > cap) {
             cap *= 2;
@@ -369,7 +375,7 @@ int generate_directory_listing(const char *dir, char **html_body, int *is_alloc,
 
         used += snprintf(*html_body + used, cap - used,
                          "<tr><td><A HREF=\"%s\">%s</A></td><td>%s</td><td>%s</td></tr>\n",
-                         de->d_name, de->d_name, time_buf, sz_buf);
+                         name_buf, name_buf, time_buf, sz_buf);
     }
     closedir(dp);
 
