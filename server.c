@@ -172,7 +172,7 @@ int handle_request(void *arg) {
 
     int resp_len = 0;
     unsigned char *resp = build_http_response(code,
-                                              (code == 200 ? req.path : NULL),
+                                              req.path,
                                               body,
                                               body_size,
                                               &resp_len);
@@ -202,7 +202,8 @@ int parse_request(const char *req_line, request_st *req) {
         return 400;
     }
 
-    /* Strip leading slash for local usage (like "./somefile") */
+    /* Strip leading slash for local usage (like "./some
+     * file") */
     if (req->path[0] == '/') {
         memmove(req->path, req->path+1, strlen(req->path));
     }
@@ -491,7 +492,9 @@ unsigned char *build_http_response(int code, char *path, const unsigned char *bo
         "Date: %s\r\n",
         code, text, date);
 
-    if (code == 302 && path) {
+    if (code == 302) {
+        if (!path)
+            path = "";
         used += snprintf(head + used, sizeof(head) - used,
                          "Location: %s/\r\n", path);
     }
