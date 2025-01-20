@@ -279,9 +279,7 @@ int has_execute_permissions(const char *full_path) {
         if (stat(d, &ds) != 0) {
             return 403;
         }
-        if (!(ds.st_mode & S_IXUSR) ||
-            !(ds.st_mode & S_IXGRP) ||
-            !(ds.st_mode & S_IXOTH)) {
+        if (!(ds.st_mode & S_IXOTH)) {
             return 403;
         }
         d = dirname(d);
