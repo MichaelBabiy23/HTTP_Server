@@ -8,6 +8,7 @@
 #include <libgen.h>
 #include <dirent.h>
 #include <time.h>
+#include <errno.h>
 #include "threadpool.h"
 
 #define RFC1123FMT "%a, %d %b %Y %H:%M:%S GMT"
@@ -22,18 +23,18 @@
   #define DEBUG_PRINT(fmt, ...) do {} while (0)
 #endif
 
+static const char *USAGE = "Usage: server <port> <pool-size> <max-queue-size> <max-number-of-request>\n";
+
 typedef struct {
     char method[FIRST_LINE_SIZE];
     char path[FIRST_LINE_SIZE];
     char version[FIRST_LINE_SIZE];
 } request_st;
 
-/* Function declarations (some are from your original code, lightly edited) */
+/* ----- Forward Declarations ----- */
 int handle_request(void *arg);
 int parse_request(const char *req_line, request_st *req);
-int construct_OK_body(char *path, unsigned char **body, int *size);
 int generate_directory_listing(const char *dir, char **html_body, int *is_alloc, int *body_size);
-int open_read_file(unsigned char **body, char *path, int *size);
 int find_index_html(const char *dir);
 int has_execute_permissions(const char *full_path);
 int is_directory(const char *p);
@@ -43,26 +44,29 @@ void get_current_date(char *buf, size_t len);
 unsigned char *build_http_response(int code, char *path, const unsigned char *body, long b_len, int *resp_len);
 void write_to_client(int fd, unsigned char *buf, int len);
 
-static const char *USAGE = "Usage: server <port> <pool-size> <max-queue-size> <max-number-of-request>\n";
+/* New streaming function for files */
+int send_file_in_chunks(int client_fd, const char *filepath);
 
-/* Main server routine: sets up socket, threadpool, accepts connections, etc. */
+/* ----- Main ----- */
 int main(int argc, char *argv[]) {
     if (argc != 5) {
         fprintf(stderr, "%s", USAGE);
         exit(EXIT_FAILURE);
     }
 
-    int port = atoi(argv[1]);
-    int poolSize = atoi(argv[2]);
-    int qMaxSize = atoi(argv[3]);
+    int port        = atoi(argv[1]);
+    int poolSize    = atoi(argv[2]);
+    int qMaxSize    = atoi(argv[3]);
     int maxRequests = atoi(argv[4]);
 
+    /* Create the threadpool */
     threadpool *tp = create_threadpool(poolSize, qMaxSize);
     if (!tp) {
         fprintf(stderr, "Cannot create thread pool\n");
         exit(EXIT_FAILURE);
     }
 
+    /* Create the server socket */
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         perror("socket");
@@ -70,11 +74,12 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
+    /* Bind */
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
+    addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(port);
+    addr.sin_port        = htons(port);
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind");
@@ -83,6 +88,7 @@ int main(int argc, char *argv[]) {
         exit(EXIT_FAILURE);
     }
 
+    /* Listen */
     if (listen(server_fd, 5) < 0) {
         perror("listen");
         close(server_fd);
@@ -92,6 +98,7 @@ int main(int argc, char *argv[]) {
 
     DEBUG_PRINT("Server listening on port %d\n", port);
 
+    /* Accept connections until maxRequests reached */
     int count = 0;
     while (count < maxRequests) {
         struct sockaddr_in client_addr;
@@ -118,26 +125,30 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 
-/* Thread function for handling a single client */
+/* ----- Thread function to handle requests ----- */
 int handle_request(void *arg) {
     int client_fd = *(int *)arg;
-    free(arg);  /* Freed after pulling from queue */
+    free(arg);  /* Freed after pulling from the queue */
 
-    /* We read only the first line to parse "METHOD PATH VERSION" */
+    DEBUG_PRINT("handle_request: start\n");
+
+    /* 1) Read only the first line to parse "METHOD PATH VERSION" */
     char req_buffer[FIRST_LINE_SIZE + 1];
     memset(req_buffer, 0, sizeof(req_buffer));
 
     int total_read = 0;
     int found_line = 0;
+
     while (total_read < FIRST_LINE_SIZE) {
         ssize_t bytes = read(client_fd, req_buffer + total_read, 1);
         if (bytes < 1) { /* error or EOF */
+            DEBUG_PRINT("handle_request: read error or EOF while reading first line\n");
             break;
         }
         total_read++;
         if (total_read >= 2 &&
-            req_buffer[total_read-2] == '\r' &&
-            req_buffer[total_read-1] == '\n') {
+            req_buffer[total_read - 2] == '\r' &&
+            req_buffer[total_read - 1] == '\n') {
             /* Found "\r\n" -> isolate the line and stop */
             req_buffer[total_read - 2] = '\0';
             found_line = 1;
@@ -145,8 +156,9 @@ int handle_request(void *arg) {
         }
     }
 
-    /* If no line found or we overflowed, return 400 immediately */
+    /* 2) If no line found or we overflowed, return 400 */
     if (!found_line) {
+        DEBUG_PRINT("handle_request: no valid request line -> 400\n");
         int tmpl;
         unsigned char *resp400 = build_http_response(400, NULL, NULL, 0, &tmpl);
         write_to_client(client_fd, resp400, tmpl);
@@ -157,55 +169,102 @@ int handle_request(void *arg) {
 
     DEBUG_PRINT("Request line: %s\n", req_buffer);
 
+    /* 3) Parse request */
     request_st req;
     memset(&req, 0, sizeof(req));
     int code = parse_request(req_buffer, &req);
+    DEBUG_PRINT("parse_request returned code %d\n", code);
 
-    /* If parse gave us 200, we still need to build the body (file or directory). */
-    unsigned char *body = NULL;
-    int body_size = 0;
+    /* 4) Handle results:
+       - 200 => normal
+       - 302 => redirect
+       - else => error
+    */
     if (code == 200) {
-        if (construct_OK_body(req.path, &body, &body_size) != 0) {
-            code = 500;
+        /* Check if directory */
+        if (is_directory(req.path)) {
+            /* Build directory listing in memory, then build response */
+            DEBUG_PRINT("handle_request: directory requested -> generating listing\n");
+            unsigned char *dir_body = NULL;
+            int dir_body_size = 0;
+            int dummy = 0;
+            if (generate_directory_listing(req.path, (char **)&dir_body, &dummy, &dir_body_size) != 0) {
+                DEBUG_PRINT("handle_request: directory listing error -> 500\n");
+                code = 500;
+                /* Build + send error */
+                int resp_len;
+                unsigned char *resp = build_http_response(code, req.path, NULL, 0, &resp_len);
+                write_to_client(client_fd, resp, resp_len);
+                free(resp);
+                close(client_fd);
+                return 0;
+            } else {
+                /* Build + send 200 response with that directory listing */
+                int resp_len;
+                unsigned char *resp = build_http_response(200, req.path, dir_body, dir_body_size, &resp_len);
+                write_to_client(client_fd, resp, resp_len);
+                free(resp);
+                free(dir_body);
+                close(client_fd);
+                return 0;
+            }
+        }
+        else {
+            /* It's a normal file => stream it */
+            DEBUG_PRINT("handle_request: file requested -> streaming in chunks\n");
+            if (send_file_in_chunks(client_fd, req.path) < 0) {
+                DEBUG_PRINT("handle_request: error while streaming file -> close\n");
+            }
+            close(client_fd);
+            return 0;
         }
     }
-
-    int resp_len = 0;
-    unsigned char *resp = build_http_response(code,
-                                              req.path,
-                                              body,
-                                              body_size,
-                                              &resp_len);
-
-    write_to_client(client_fd, resp, resp_len);
-
-    if (body) free(body);
-    if (resp) free(resp);
-
-    close(client_fd);
-    return 0;
+    else if (code == 302) {
+        /* We have to redirect (missing slash for directory) */
+        DEBUG_PRINT("handle_request: redirect -> 302\n");
+        int resp_len = 0;
+        unsigned char *resp = build_http_response(302, req.path, NULL, 0, &resp_len);
+        write_to_client(client_fd, resp, resp_len);
+        free(resp);
+        close(client_fd);
+        return 0;
+    }
+    else {
+        /* Some error code */
+        DEBUG_PRINT("handle_request: error code %d\n", code);
+        int resp_len = 0;
+        unsigned char *resp = build_http_response(code, req.path, NULL, 0, &resp_len);
+        write_to_client(client_fd, resp, resp_len);
+        free(resp);
+        close(client_fd);
+        return 0;
+    }
 }
 
-/* Parses "METHOD PATH VERSION" from the request line */
+/* ----- Parses "METHOD PATH VERSION" from the request line ----- */
 int parse_request(const char *req_line, request_st *req) {
     if (sscanf(req_line, "%s %s %s", req->method, req->path, req->version) != 3) {
-        return 400; /* Bad request if not exactly 3 tokens */
+        return 400; // Bad request if not exactly 3 tokens
     }
 
-    /* Only GET is supported */
+    // Only GET is supported
     if (strcasecmp(req->method, "GET") != 0) {
         return 501;
     }
 
-    /* Must be HTTP/1.x basically */
+    // Must be HTTP/1.x basically
     if (strstr(req->version, "HTTP/") == NULL) {
         return 400;
     }
 
-    /* Strip leading slash for local usage (like "./some
-     * file") */
+    // Strip leading slash from path for local usage
     if (req->path[0] == '/') {
-        memmove(req->path, req->path+1, strlen(req->path));
+        memmove(req->path, req->path + 1, strlen(req->path));
+    }
+
+    // If no path => stat current directory (".")
+    if (strlen(req->path) == 0) {
+        strcpy(req->path, ".");
     }
 
     struct stat s;
@@ -213,29 +272,41 @@ int parse_request(const char *req_line, request_st *req) {
         return 404;
     }
 
-    /* Directory logic: if missing slash, return 302.  If slash is present, maybe check index.html. */
     if (S_ISDIR(s.st_mode)) {
+        // <== FIX: If req->path == ".", user typed GET / => skip the 302
+        if (strcmp(req->path, ".") == 0) {
+            return has_execute_permissions(req->path);
+        }
+
+        // Else normal directory check: if no slash at end, do redirect
         size_t plen = strlen(req->path);
-        if (plen == 0) {
-            /* It's basically the root "./" => just handle it as directory */
-            return 200;
+        if (plen > 0 && req->path[plen - 1] != '/') {
+            return 302;
         }
-        if (req->path[plen - 1] != '/') {
-            return 302; /* Must end with '/' => redirect */
-        }
-        /* If the directory has index.html, use that. */
+
+        // If the directory has index.html, serve that
         if (find_index_html(req->path)) {
             strcat(req->path, "index.html");
+            // Re-stat to confirm
+            if (stat(req->path, &s) != 0) {
+                return 404;
+            }
+            if (!S_ISREG(s.st_mode) || !(s.st_mode & S_IROTH)) {
+                return 403;
+            }
+            return has_execute_permissions(req->path);
         }
-        return 200;
+
+        // Otherwise, just a directory listing
+        return has_execute_permissions(req->path);
     }
 
-    /* File logic: must be regular file + have world-read perms */
+    // File logic: must be reg file + have world read
     if (!S_ISREG(s.st_mode) || !(s.st_mode & S_IROTH)) {
         return 403;
     }
 
-    /* If file in subdirectory, check +x perms on the directories */
+    // Check +x perms on the directories leading to it
     if (strchr(req->path, '/') != NULL) {
         return has_execute_permissions(req->path);
     }
@@ -243,78 +314,13 @@ int parse_request(const char *req_line, request_st *req) {
     return 200;
 }
 
-/* If path ends with '/', treat as directory.  Build listing or read index.html if it exists. */
-int construct_OK_body(char *path, unsigned char **body, int *size) {
-    if (is_directory(path)) {
-        /* Build directory listing if it's truly a directory. */
-        int dummy = 0;
-        if (generate_directory_listing(path, (char **)body, &dummy, size) != 0) {
-            return -1;
-        }
-        return 0;
-    }
-    /* Read file into memory */
-    return open_read_file(body, path, size);
-}
-
-/* Returns 1 if "dirname/index.html" exists, else 0 */
-int find_index_html(const char *dir) {
-    char tmp[FIRST_LINE_SIZE];
-    snprintf(tmp, sizeof(tmp), "%sindex.html", dir);
-    struct stat s;
-    if (stat(tmp, &s) == 0 && S_ISREG(s.st_mode)) {
-        return 1;
-    }
-    return 0;
-}
-
-/* Checks +x perms on each directory in path. 403 if any directory lacks x bits */
-int has_execute_permissions(const char *full_path) {
-    char copy[FIRST_LINE_SIZE];
-    strncpy(copy, full_path, sizeof(copy));
-    char *d = dirname(copy);
-
-    struct stat ds;
-    while (strcmp(d, ".") != 0 && strcmp(d, "/") != 0) {
-        if (stat(d, &ds) != 0) {
-            return 403;
-        }
-        if (!(ds.st_mode & S_IXOTH)) {
-            return 403;
-        }
-        d = dirname(d);
-    }
-    return 200;
-}
-
-/* Reads file fully into memory.  Caller frees. */
-int open_read_file(unsigned char **body, char *path, int *size) {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        return -1;
-    }
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-
-    *body = malloc(sz+1);
-    if (!*body) {
-        fclose(f);
-        return -1;
-    }
-    fread(*body, 1, sz, f);
-    (*body)[sz] = '\0'; /* Ensure it's null-terminated if text */
-    fclose(f);
-
-    *size = (int)sz;
-    DEBUG_PRINT("open_read_file : body = %d \n", *size);
-    return 0;
-}
-
-/* Builds an HTML listing of a directory with last-mod times and sizes. */
+/* ----- For a directory, build an HTML listing ----- */
 int generate_directory_listing(const char *dir, char **html_body, int *is_alloc, int *body_size) {
     DIR *dp = opendir(dir);
-    if (!dp) return -1;
+    if (!dp) {
+        DEBUG_PRINT("generate_directory_listing: cannot open dir %s\n", dir);
+        return -1;
+    }
 
     *html_body = malloc(INITIAL_BUFFER_SIZE);
     if (!*html_body) {
@@ -395,13 +401,47 @@ int generate_directory_listing(const char *dir, char **html_body, int *is_alloc,
     return 0;
 }
 
-/* Checks if path ends with '/' so we treat it as a directory path. */
+/* ----- Helper to see if path ends with '/' so we treat it as directory ----- */
 int is_directory(const char *p) {
-    int len = strlen(p);
-    return (len > 0 && p[len-1] == '/');
+    struct stat s;
+    if (stat(p, &s) == 0 && S_ISDIR(s.st_mode)) {
+        return 1;
+    }
+    return 0;
 }
 
-/* Gets RFC1123 last-mod date for a file. Returns static string or NULL on error. */
+
+/* ----- Check if a directory has index.html (return 1 if yes, 0 if no) ----- */
+int find_index_html(const char *dir) {
+    char tmp[FIRST_LINE_SIZE];
+    snprintf(tmp, sizeof(tmp), "%sindex.html", dir);
+    struct stat s;
+    if (stat(tmp, &s) == 0 && S_ISREG(s.st_mode)) {
+        return 1;
+    }
+    return 0;
+}
+
+/* ----- Check +x perms on each directory in path. Return 403 if any directory lacks x bits ----- */
+int has_execute_permissions(const char *full_path) {
+    char copy[FIRST_LINE_SIZE];
+    strncpy(copy, full_path, sizeof(copy));
+    char *d = dirname(copy);
+
+    struct stat ds;
+    while (strcmp(d, ".") != 0 && strcmp(d, "/") != 0) {
+        if (stat(d, &ds) != 0) {
+            return 403;
+        }
+        if (!(ds.st_mode & S_IXOTH)) {
+            return 403;
+        }
+        d = dirname(d);
+    }
+    return 200;
+}
+
+/* ----- Returns a static buffer with the last-mod date in RFC1123, or NULL on error ----- */
 char *get_last_modified_date(const char *path) {
     static char buf[128];
     struct stat s;
@@ -413,7 +453,7 @@ char *get_last_modified_date(const char *path) {
     return buf;
 }
 
-/* Quick check for known MIME types */
+/* ----- Basic MIME type guesser ----- */
 char *get_mime_type(char *filename) {
     char *dot = strrchr(filename, '.');
     if (!dot) return NULL;
@@ -430,13 +470,13 @@ char *get_mime_type(char *filename) {
     return NULL;
 }
 
-/* Current date in RFC1123 format */
+/* ----- Current date in RFC1123 format ----- */
 void get_current_date(char *buf, size_t len) {
     time_t now = time(NULL);
     strftime(buf, len, RFC1123FMT, gmtime(&now));
 }
 
-/* Writes all data in 'buf' to 'fd' until done or error */
+/* ----- Write all data to client ----- */
 void write_to_client(int fd, unsigned char *buf, int len) {
     int sent = 0;
     while (sent < len) {
@@ -449,7 +489,11 @@ void write_to_client(int fd, unsigned char *buf, int len) {
     }
 }
 
-/* Builds headers + body. If not 200, we embed a small HTML body describing the error/redirect. */
+/*
+ * Builds full HTTP response for:
+ * - Errors (non-200), with a small HTML body
+ * - Directory listing (200) stored in memory
+ */
 unsigned char *build_http_response(int code, char *path, const unsigned char *body, long b_len, int *resp_len) {
     static const char *err_tmpl =
       "<HTML><HEAD><TITLE>%d %s</TITLE></HEAD>\r\n"
@@ -478,7 +522,8 @@ unsigned char *build_http_response(int code, char *path, const unsigned char *bo
     } else {
         actual_body_len = b_len;  // Use provided body length for 200 responses
     }
-    DEBUG_PRINT("build_http_response : actual_body_len = %li \n", actual_body_len);
+    DEBUG_PRINT("build_http_response: actual_body_len = %li\n", actual_body_len);
+
     /* Make a small buffer for headers. */
     char head[512];
     char date[128];
@@ -490,11 +535,20 @@ unsigned char *build_http_response(int code, char *path, const unsigned char *bo
         "Date: %s\r\n",
         code, text, date);
 
+    /* ----- The Fix: if code=302, handle path="." vs others ----- */
     if (code == 302) {
-        if (!path)
+        if (!path) {
             path = "";
-        used += snprintf(head + used, sizeof(head) - used,
-                         "Location: %s/\r\n", path);
+        }
+        if (strcmp(path, ".") == 0) {
+            /* Redirect to root slash */
+            used += snprintf(head + used, sizeof(head) - used,
+                             "Location: /\r\n");
+        } else {
+            /* e.g. path="subdir" -> Location: /subdir/ */
+            used += snprintf(head + used, sizeof(head) - used,
+                             "Location: /%s/\r\n", path);
+        }
     }
 
     /* Set Content-Type */
@@ -504,7 +558,6 @@ unsigned char *build_http_response(int code, char *path, const unsigned char *bo
     } else if (code != 200) {
         mtype = "text/html";  // Error responses are always HTML
     }
-
     if (mtype) {
         used += snprintf(head + used, sizeof(head) - used,
                          "Content-Type: %s\r\n", mtype);
@@ -542,4 +595,94 @@ unsigned char *build_http_response(int code, char *path, const unsigned char *bo
 
     *resp_len = used + actual_body_len; // Full response size
     return resp;
+}
+
+/*
+ * New function: send a file in chunks using HTTP/1.0 style.
+ * 1) We do a stat() to get file size + last modified.
+ * 2) Write headers first (with Content-Length).
+ * 3) Then read in chunks (e.g. 1000 bytes) and write each chunk immediately.
+ * 4) Return 0 on success, -1 on any error.
+ */
+int send_file_in_chunks(int client_fd, const char *filepath) {
+    DEBUG_PRINT("send_file_in_chunks: start with path=%s\n", filepath);
+
+    /* 1) Stat the file */
+    struct stat st;
+    if (stat(filepath, &st) < 0) {
+        perror("stat");
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        DEBUG_PRINT("send_file_in_chunks: not a regular file\n");
+        return -1;
+    }
+    long file_size = st.st_size;
+
+    /* 2) Open the file */
+    FILE *fp = fopen(filepath, "rb");
+    if (!fp) {
+        perror("fopen");
+        return -1;
+    }
+
+    /* 3) Build and send headers */
+    char head[1024];
+    char date[128];
+    get_current_date(date, sizeof(date));
+
+    char *lmod = get_last_modified_date(filepath);
+    const char *mime = get_mime_type((char *)filepath);
+    if (!mime) {
+        mime = "application/octet-stream";  /* fallback */
+    }
+
+    int used = snprintf(head, sizeof(head),
+                        "HTTP/1.0 200 OK\r\n"
+                        "Server: webserver/1.0\r\n"
+                        "Date: %s\r\n"
+                        "Content-Type: %s\r\n"
+                        "Content-Length: %ld\r\n",
+                        date, mime, file_size);
+
+    if (lmod) {
+        used += snprintf(head + used, sizeof(head) - used,
+                         "Last-Modified: %s\r\n", lmod);
+    }
+
+    used += snprintf(head + used, sizeof(head) - used,
+                     "Connection: close\r\n\r\n");
+
+    DEBUG_PRINT("send_file_in_chunks: sending headers (len=%d)\n", used);
+
+    /* Send the headers */
+    write_to_client(client_fd, (unsigned char *)head, used);
+
+    /* 4) Read file in chunks and send each */
+    unsigned char buffer[1000];
+    size_t n;
+    while ((n = fread(buffer, 1, sizeof(buffer), fp)) > 0) {
+        DEBUG_PRINT("send_file_in_chunks: read %zu bytes, sending to client\n", n);
+        int sent = 0;
+        while (sent < (int)n) {
+            int w = write(client_fd, buffer + sent, n - sent);
+            if (w < 0) {
+                perror("write");
+                fclose(fp);
+                return -1;
+            }
+            sent += w;
+        }
+    }
+
+    /* 5) Check for read errors */
+    if (ferror(fp)) {
+        perror("fread");
+        fclose(fp);
+        return -1;
+    }
+
+    fclose(fp);
+    DEBUG_PRINT("send_file_in_chunks: done streaming file\n");
+    return 0;
 }

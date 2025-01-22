@@ -5,4 +5,5 @@ set(CMAKE_C_STANDARD 11)
 
 add_executable(HTTP_Server main.c
         server.c
-        threadpool.c)
+        threadpool.c
+        server_test.c)
